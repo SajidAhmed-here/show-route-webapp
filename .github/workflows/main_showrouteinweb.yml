@@ -1,63 +1,156 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-# More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
+# Azure prerequisites (these are App Service settings, not GitHub variables):
+# - Existing Linux app: showrouteinweb, production slot, Python 3.9 runtime.
+#   Python 3.9 is legacy; confirm it is still available for this existing app.
+#   The unchanged scipy==1.7.1 requirement rejects Python 3.10 and newer.
+# - SCM_DO_BUILD_DURING_DEPLOYMENT=true (install requirements on Azure).
+# - DISABLE_COLLECTSTATIC=true (settings.py does not define STATIC_ROOT).
+# - SCM basic authentication enabled for publish-profile deployment.
+# - Startup command: gunicorn --bind=0.0.0.0:8000 show_route.wsgi:application
+#   Gunicorn is supplied by the Azure built-in Python image.
+# Required GitHub secret, preserved from the original workflow:
+# AZUREAPPSERVICE_PUBLISHPROFILE_84269337A46E41B49380628476D649AA
+# No additional GitHub repository variables or secrets are required.
+# Do not restore main_showrouteinweb.yml alongside this replacement: both deploy.
 
 name: Build and deploy Python app to Azure Web App - showrouteinweb
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AZURE_WEBAPP_NAME: showrouteinweb
+  PYTHON_VERSION: '3.9'
+  DJANGO_SETTINGS_MODULE: show_route.settings
+  PYTHONDONTWRITEBYTECODE: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v2
+      - name: Check out source
+        uses: actions/checkout@v6
 
-      - name: Set up Python version
-        uses: actions/setup-python@v1
+      - name: Set up compatible Python
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.8'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Create and start virtual environment
+      - name: Install original dependencies
+        # Keep legacy source builds compatible without editing requirements.txt.
         run: |
-          python -m venv venv
-          source venv/bin/activate
-      
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-        
-      # Optional: Add step to run tests here (PyTest, Django test suites, etc.)
-      
-      - name: Upload artifact for deployment jobs
-        uses: actions/upload-artifact@v2
+          python -m pip install pip==24.0 setuptools==57.5.0 wheel==0.41.3
+          python -m pip install --prefer-binary -r requirements.txt
+          python -m pip check
+
+      - name: Validate Django configuration and migrations
+        run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
+          python manage.py migrate --noinput
+          python manage.py test --noinput
+
+      - name: Smoke test map and route rendering without external services
+        # route/tests.py is empty. Exercise both views with a fixed OSRM response
+        # so OSRM availability cannot make this build fail unpredictably.
+        run: |
+          python - <<'PY'
+          import django
+          import polyline
+          from unittest.mock import Mock, patch
+          from django.test import Client
+
+          django.setup()
+          client = Client()
+          home = client.get('/')
+          assert home.status_code == 200, home.status_code
+          assert b'id="map"' in home.content
+
+          response = Mock(status_code=200)
+          response.json.return_value = {
+              'routes': [{
+                  'geometry': polyline.encode([(11.0, 79.0), (11.1, 79.1)]),
+                  'distance': 15000,
+              }],
+              'waypoints': [
+                  {'location': [79.0, 11.0]},
+                  {'location': [79.1, 11.1]},
+              ],
+          }
+          with patch('route.getroute.requests.get', return_value=response) as request:
+              route = client.get('/11.0,79.0,11.1,79.1')
+              assert route.status_code == 200, route.status_code
+              assert b'L.polyline(' in route.content
+              request.assert_called_once_with(
+                  'http://router.project-osrm.org/route/v1/driving/'
+                  '79.0,11.0;79.1,11.1'
+              )
+          print('Both views rendered successfully.')
+          PY
+
+      - name: Package application source
+        # Azure installs Linux dependencies itself. Exclude the CI SQLite DB,
+        # virtual environments, Git metadata, and workflow files explicitly.
+        run: |
+          tar --exclude='__pycache__' --exclude='*.pyc' -czf "$RUNNER_TEMP/python-app.tar.gz" \
+            manage.py requirements.txt README.md route show_route templates
+
+      - name: Upload deployment artifact
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: |
-            . 
-            !venv/
+          path: ${{ runner.temp }}/python-app.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   deploy:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    concurrency:
+      group: showrouteinweb-production
+      cancel-in-progress: false
     environment:
-      name: 'Production'
+      name: Production
       url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
-
     steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v2
+      - name: Validate publish-profile secret
+        env:
+          AZURE_PUBLISH_PROFILE: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_84269337A46E41B49380628476D649AA }}
+        run: |
+          if [ -z "$AZURE_PUBLISH_PROFILE" ]; then
+            echo '::error::Missing GitHub secret AZUREAPPSERVICE_PUBLISHPROFILE_84269337A46E41B49380628476D649AA. Configure it in repository secrets or the Production environment.'
+            exit 1
+          fi
+
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v5
         with:
           name: python-app
-          path: .
-          
-      - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v2
+          path: ${{ runner.temp }}/artifact
+
+      - name: Extract application
+        run: |
+          mkdir -p "$RUNNER_TEMP/deployment"
+          tar -xzf "$RUNNER_TEMP/artifact/python-app.tar.gz" -C "$RUNNER_TEMP/deployment"
+
+      - name: Deploy to Azure Web App
         id: deploy-to-webapp
+        uses: azure/webapps-deploy@v3
         with:
-          app-name: 'showrouteinweb'
-          slot-name: 'Production'
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          slot-name: production
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_84269337A46E41B49380628476D649AA }}
+          package: ${{ runner.temp }}/deployment
